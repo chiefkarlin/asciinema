@@ -36,8 +36,8 @@ fn download_asciicast(url: &str) -> anyhow::Result<NamedTempFile> {
                 .host_str()
                 .is_some_and(|h| h.eq_ignore_ascii_case("storage.googleapis.com"));
             if !is_gcs {
-                if let Some((hdr_name, hdr_val)) = crate::api::get_transport_auth_header() {
-                    req = req.header(hdr_name, hdr_val);
+                if let Some(token) = crate::api::get_iap_token() {
+                    req = req.header("proxy-authorization", format!("Bearer {token}"));
                 }
             }
             let resp = req.send()?;

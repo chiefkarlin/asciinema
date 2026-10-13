@@ -154,36 +154,11 @@ fn build_request(url: &url::Url) -> anyhow::Result<ClientRequestBuilder> {
         .with_sub_protocol("v1.alis")
         .with_header("user-agent", api::build_user_agent());
 
-    if let Some((hdr_name, hdr_val)) = api::get_transport_auth_header() {
-        builder = builder.with_header(hdr_name, hdr_val);
-    } else if url.host_str().is_some_and(|h| h.ends_with(".run.app")) {
-        if let Some(token) = get_cloud_run_id_token() {
-            builder = builder.with_header("x-serverless-authorization", format!("Bearer {token}"));
-        }
+    if let Some(token) = api::get_iap_token() {
+        builder = builder.with_header("proxy-authorization", format!("Bearer {token}"));
     }
 
     Ok(builder)
-}
-
-fn get_cloud_run_id_token() -> Option<String> {
-    if let Ok(tok) = std::env::var("ASCIINEMA_CLOUD_RUN_ID_TOKEN") {
-        let tok = tok.trim();
-        if !tok.is_empty() {
-            return Some(tok.to_owned());
-        }
-    }
-    let output = std::process::Command::new("gcloud")
-        .args(["auth", "print-identity-token"])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let tok = String::from_utf8(output.stdout).ok()?;
-        let tok = tok.trim();
-        if !tok.is_empty() {
-            return Some(tok.to_owned());
-        }
-    }
-    None
 }
 
 fn get_alis_stream(

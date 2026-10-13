@@ -670,96 +670,18 @@ fn add_headers(builder: RequestBuilder, install_id: &str) -> RequestBuilder {
         .header(header::USER_AGENT, build_user_agent())
         .header(header::ACCEPT, "application/json");
 
-    if let Some((hdr_name, hdr_val)) = get_transport_auth_header() {
-        builder = builder.header(hdr_name, hdr_val);
+    if let Some(token) = get_iap_token() {
+        builder = builder.header("proxy-authorization", format!("Bearer {token}"));
     }
 
     builder
 }
 
-pub fn get_transport_auth_header() -> Option<(&'static str, String)> {
-    let mode = env::var("ASCIINEMA_TRANSPORT_MODE")
-        .or_else(|_| env::var("SCION_TRANSPORT_MODE"))
-        .unwrap_or_else(|_| "iap".to_owned());
-
-    let header_name = if mode.eq_ignore_ascii_case("cloudrun_invoker")
-        || mode.eq_ignore_ascii_case("serverless")
-    {
-        "x-serverless-authorization"
-    } else {
-        "proxy-authorization"
-    };
-
-    if let Some(token) = resolve_transport_token() {
-        return Some((header_name, format!("Bearer {token}")));
-    }
-
-    if let Ok(tok) = env::var("ASCIINEMA_CLOUD_RUN_ID_TOKEN") {
-        let tok = tok.trim();
-        if !tok.is_empty() {
-            return Some(("x-serverless-authorization", format!("Bearer {tok}")));
-        }
-    }
-
-    None
-}
-
-fn resolve_transport_token() -> Option<String> {
-    for var in ["ASCIINEMA_TRANSPORT_TOKEN", "SCION_TRANSPORT_TOKEN"] {
-        if let Ok(val) = env::var(var) {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_owned());
-            }
-        }
-    }
-
-    for file_var in ["ASCIINEMA_TRANSPORT_TOKEN_FILE", "SCION_TRANSPORT_TOKEN_FILE"] {
-        if let Ok(path) = env::var(file_var) {
-            let path = path.trim();
-            if !path.is_empty() {
-                if let Ok(contents) = std::fs::read_to_string(path) {
-                    let trimmed = contents.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_owned());
-                    }
-                }
-            }
-        }
-    }
-
-    let audience = env::var("ASCIINEMA_TRANSPORT_AUDIENCE")
-        .or_else(|_| env::var("SCION_TRANSPORT_AUDIENCE"))
+pub fn get_iap_token() -> Option<String> {
+    env::var("ASCIINEMA_IAP_TOKEN")
         .ok()
         .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())?;
-
-    static MINTED_TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    MINTED_TOKEN
-        .get_or_init(|| {
-            let mut cmd = std::process::Command::new("gcloud");
-            cmd.args(["auth", "print-identity-token"]);
-            if let Ok(sa) = env::var("ASCIINEMA_SA_EMAIL").or_else(|_| env::var("SCION_SA_EMAIL")) {
-                let sa = sa.trim();
-                if !sa.is_empty() {
-                    cmd.arg(format!("--impersonate-service-account={sa}"));
-                }
-            }
-            cmd.arg(format!("--audiences={audience}"));
-            cmd.arg("--include-email");
-            let output = cmd.output().ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let stdout = String::from_utf8(output.stdout).ok()?;
-            stdout
-                .lines()
-                .rev()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .map(str::to_owned)
-        })
-        .clone()
+        .filter(|s| !s.is_empty())
 }
 
 fn get_username() -> String {
