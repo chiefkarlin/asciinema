@@ -285,12 +285,6 @@ async fn upload_file_to_storage(
     path: &str,
     byte_size: u64,
 ) -> Result<()> {
-    let file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("failed to open recording file {path}"))?;
-    let stream = ReaderStream::with_capacity(file, UPLOAD_STREAM_BUFFER_SIZE);
-    let body = Body::wrap_stream(stream);
-
     // Client with no overall request timeout so multi-GB uploads do not time out.
     let client = Client::builder().build()?;
     let method = upload_method
@@ -298,39 +292,55 @@ async fn upload_file_to_storage(
         .parse::<reqwest::Method>()
         .unwrap_or(reqwest::Method::PUT);
 
-    // CRITICAL: Do NOT call add_headers() here — never leak asciinema Basic Auth to GCS!
-    let mut builder = client
-        .request(method, upload_url)
-        .header(header::USER_AGENT, build_user_agent())
-        .header(header::CONTENT_LENGTH, byte_size);
+    let max_attempts = 3usize;
+    for attempt in 1..=max_attempts {
+        let file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("failed to open recording file {path}"))?;
+        let stream = ReaderStream::with_capacity(file, UPLOAD_STREAM_BUFFER_SIZE);
+        let body = Body::wrap_stream(stream);
 
-    let mut has_content_type = false;
-    if let Some(headers) = extra_headers {
-        for (name, value) in headers {
-            if name.eq_ignore_ascii_case("authorization")
-                || name.eq_ignore_ascii_case("content-length")
-            {
-                continue;
+        // CRITICAL: Do NOT call add_headers() here — never leak asciinema Basic Auth to GCS!
+        let mut builder = client
+            .request(method.clone(), upload_url)
+            .header(header::USER_AGENT, build_user_agent())
+            .header(header::CONTENT_LENGTH, byte_size);
+
+        let mut has_content_type = false;
+        if let Some(headers) = extra_headers {
+            for (name, value) in headers {
+                if name.eq_ignore_ascii_case("authorization")
+                    || name.eq_ignore_ascii_case("content-length")
+                {
+                    continue;
+                }
+                if name.eq_ignore_ascii_case("content-type") {
+                    has_content_type = true;
+                }
+                builder = builder.header(name.as_str(), value.as_str());
             }
-            if name.eq_ignore_ascii_case("content-type") {
-                has_content_type = true;
-            }
-            builder = builder.header(name.as_str(), value.as_str());
         }
-    }
 
-    if !has_content_type {
-        builder = builder.header(header::CONTENT_TYPE, ASCIICAST_CONTENT_TYPE);
-    }
+        if !has_content_type {
+            builder = builder.header(header::CONTENT_TYPE, ASCIICAST_CONTENT_TYPE);
+        }
 
-    let response = builder
-        .body(body)
-        .send()
-        .await
-        .context("failed to upload recording data to storage")?;
+        let response = builder
+            .body(body)
+            .send()
+            .await
+            .context("failed to upload recording data to storage")?;
 
-    if !response.status().is_success() {
+        if response.status().is_success() {
+            return Ok(());
+        }
+
         let status = response.status();
+        if attempt < max_attempts && matches!(status.as_u16(), 429 | 502 | 503 | 504) {
+            tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64))).await;
+            continue;
+        }
+
         let body_text = response.text().await.unwrap_or_default();
         if body_text.trim().is_empty() {
             bail!("storage upload failed with HTTP status {status}");
