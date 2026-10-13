@@ -19,9 +19,11 @@ pub fn get_local_path(filename: &str) -> anyhow::Result<Box<dyn AsRef<Path>>> {
 }
 
 fn download_asciicast(url: &str) -> anyhow::Result<NamedTempFile> {
-    use reqwest::blocking::get;
+    use reqwest::blocking::Client;
 
-    let mut response = get(Url::parse(url)?)?;
+    let client = Client::builder().timeout(None).build()?;
+    let parsed_url = Url::parse(url)?;
+    let mut response = client.get(parsed_url.clone()).send()?;
     response.error_for_status_ref()?;
     let mut file = NamedTempFile::new()?;
 
@@ -29,11 +31,18 @@ fn download_asciicast(url: &str) -> anyhow::Result<NamedTempFile> {
         .headers()
         .get("content-type")
         .ok_or(anyhow!("no content-type header in the response"))?
-        .to_str()?;
+        .to_str()?
+        .to_owned();
 
     if content_type.starts_with("text/html") {
-        if let Some(url) = html::extract_asciicast_link(&response.text()?) {
-            let mut response = get(Url::parse(&url)?)?;
+        let base_url = response.url().clone();
+        let html_body = response.text()?;
+
+        if let Some(href) = html::extract_asciicast_link(&html_body) {
+            let cast_url = base_url
+                .join(&href)
+                .or_else(|_| parsed_url.join(&href))?;
+            let mut response = client.get(cast_url).send()?;
             response.error_for_status_ref()?;
             io::copy(&mut response, &mut file)?;
 
@@ -175,5 +184,134 @@ mod tests {
         }
 
         assert_eq!(quantized, expected);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    use axum::extract::State;
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::Router;
+    use tokio::net::TcpListener;
+    use tokio::runtime::Runtime;
+    use tokio::sync::oneshot;
+
+    use crate::asciicast::{self, EventData, Version};
+
+    #[derive(Default)]
+    struct DownloadMockState {
+        html_hits: AtomicUsize,
+        cast_redirect_hits: AtomicUsize,
+        gcs_hits: AtomicUsize,
+        server_url: std::sync::OnceLock<String>,
+    }
+
+    #[test]
+    fn download_asciicast_resolves_relative_link_and_follows_302_redirect_to_gcs() {
+        let state = Arc::new(DownloadMockState::default());
+        let state_for_server = Arc::clone(&state);
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let server_thread = thread::spawn(move || {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let base_url = format!("http://{addr}");
+                let _ = state_for_server.server_url.set(base_url);
+                addr_tx.send(addr).unwrap();
+
+                let app = Router::new()
+                    .route(
+                        "/a/test",
+                        get(|State(st): State<Arc<DownloadMockState>>| async move {
+                            st.html_hits.fetch_add(1, Ordering::SeqCst);
+                            let html = r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="alternate" type="application/x-asciicast" href="/a/test.cast">
+</head>
+<body>Recording Page</body>
+</html>"#;
+                            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
+                        }),
+                    )
+                    .route(
+                        "/a/test.cast",
+                        get(|State(st): State<Arc<DownloadMockState>>| async move {
+                            st.cast_redirect_hits.fetch_add(1, Ordering::SeqCst);
+                            let base = st.server_url.get().unwrap();
+                            let gcs_url = format!(
+                                "{base}/gcs/bucket/recordings/test.cast?X-Goog-Algorithm=GOOG4-RSA-SHA256"
+                            );
+                            (
+                                StatusCode::FOUND,
+                                [
+                                    (header::LOCATION, gcs_url),
+                                    (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".to_owned()),
+                                ],
+                                "",
+                            )
+                                .into_response()
+                        }),
+                    )
+                    .route(
+                        "/gcs/bucket/recordings/test.cast",
+                        get(|State(st): State<Arc<DownloadMockState>>| async move {
+                            st.gcs_hits.fetch_add(1, Ordering::SeqCst);
+                            let cast_body = concat!(
+                                "{\"version\":3,\"term\":{\"cols\":100,\"rows\":50}}\n",
+                                "[1.25, \"o\", \"hello from gcs redirect\"]\n"
+                            );
+                            (
+                                [(header::CONTENT_TYPE, "application/x-asciicast")],
+                                cast_body,
+                            )
+                        }),
+                    )
+                    .with_state(state_for_server);
+
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await;
+            });
+        });
+
+        let addr = addr_rx.recv().unwrap();
+        let page_url = format!("http://{addr}/a/test");
+
+        let local_path = super::get_local_path(&page_url).unwrap();
+        let cast = asciicast::open_from_path(&*local_path).unwrap();
+
+        assert_eq!(cast.version, Version::Three);
+        assert_eq!((cast.header.term_cols, cast.header.term_rows), (100, 50));
+
+        let events = cast.events.collect::<anyhow::Result<Vec<_>>>().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(events[0].data, EventData::Output(ref s) if s == "hello from gcs redirect")
+        );
+
+        assert_eq!(state.html_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cast_redirect_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.gcs_hits.load(Ordering::SeqCst), 1);
+
+        // Also verify direct .cast URL download following 302 redirect
+        let direct_cast_url = format!("http://{addr}/a/test.cast");
+        let direct_local_path = super::get_local_path(&direct_cast_url).unwrap();
+        let direct_cast = asciicast::open_from_path(&*direct_local_path).unwrap();
+        assert_eq!(direct_cast.version, Version::Three);
+        assert_eq!(state.cast_redirect_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(state.gcs_hits.load(Ordering::SeqCst), 2);
+
+        let _ = shutdown_tx.send(());
+        server_thread.join().unwrap();
     }
 }

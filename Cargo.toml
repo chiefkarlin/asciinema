@@ -37,7 +37,7 @@ rgb = { version = "0.8", default-features = false }
 url = "2.5"
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 rand = "0.9"
 async-trait = "0.1"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }

@@ -23,6 +23,8 @@ pub struct Config {
     pub session: Session,
     pub playback: Playback,
     pub notifications: Notifications,
+    #[serde(skip)]
+    install_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +104,10 @@ impl Config {
     }
 
     pub fn get_install_id(&self) -> Result<String> {
+        if let Some(id) = &self.install_id {
+            return Ok(id.clone());
+        }
+
         let path = install_id_path()?;
         let legacy_path = legacy_install_id_path()?;
 
@@ -114,6 +120,28 @@ impl Config {
             save_install_id(&path, &id)?;
 
             Ok(id)
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(server_url: &str, install_id: &str) -> Self {
+        Self {
+            server: Server {
+                url: Some(server_url.to_owned()),
+            },
+            session: Session::default(),
+            playback: Playback {
+                speed: None,
+                idle_time_limit: None,
+                pause_key: None,
+                step_key: None,
+                next_marker_key: None,
+            },
+            notifications: Notifications {
+                enabled: false,
+                command: None,
+            },
+            install_id: Some(install_id.to_owned()),
         }
     }
 }

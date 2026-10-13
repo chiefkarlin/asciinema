@@ -150,9 +150,38 @@ async fn connect_and_forward(
 fn build_request(url: &url::Url) -> anyhow::Result<ClientRequestBuilder> {
     let uri: Uri = url.to_string().parse()?;
 
-    Ok(ClientRequestBuilder::new(uri)
+    let mut builder = ClientRequestBuilder::new(uri)
         .with_sub_protocol("v1.alis")
-        .with_header("user-agent", api::build_user_agent()))
+        .with_header("user-agent", api::build_user_agent());
+
+    if url.host_str().is_some_and(|h| h.ends_with(".run.app")) {
+        if let Some(token) = get_cloud_run_id_token() {
+            builder = builder.with_header("x-serverless-authorization", format!("Bearer {token}"));
+        }
+    }
+
+    Ok(builder)
+}
+
+fn get_cloud_run_id_token() -> Option<String> {
+    if let Ok(tok) = std::env::var("ASCIINEMA_CLOUD_RUN_ID_TOKEN") {
+        let tok = tok.trim();
+        if !tok.is_empty() {
+            return Some(tok.to_owned());
+        }
+    }
+    let output = std::process::Command::new("gcloud")
+        .args(["auth", "print-identity-token"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let tok = String::from_utf8(output.stdout).ok()?;
+        let tok = tok.trim();
+        if !tok.is_empty() {
+            return Some(tok.to_owned());
+        }
+    }
+    None
 }
 
 fn get_alis_stream(

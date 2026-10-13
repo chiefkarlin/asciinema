@@ -6,7 +6,7 @@ mod v3;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ pub use v2::V2Encoder;
 pub use v3::V3Encoder;
 
 const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
+const MAX_V1_SIZE: usize = 32 * 1024 * 1024;
 
 pub struct Asciicast<'a> {
     pub version: Version,
@@ -143,18 +144,51 @@ pub fn is_zstd<S: AsRef<Path>>(path: S) -> Result<bool> {
     Ok(reader.fill_buf()?.starts_with(ZSTD_MAGIC))
 }
 
-pub fn open<'a, R: BufRead + Send + 'a>(reader: R) -> Result<Asciicast<'a>> {
-    let mut lines = reader.lines();
-    let first_line = lines.next().ok_or(anyhow!("empty file"))??;
+pub fn open<'a, R: BufRead + Send + 'a>(mut reader: R) -> Result<Asciicast<'a>> {
+    let mut first_line = String::new();
+    let bytes_read = reader
+        .by_ref()
+        .take((MAX_V1_SIZE as u64) + 1)
+        .read_line(&mut first_line)?;
+
+    if bytes_read == 0 {
+        return Err(anyhow!("empty file"));
+    }
+
+    if bytes_read > MAX_V1_SIZE {
+        return Err(anyhow!("not a v1, v2, v3 asciicast file"));
+    }
+
+    if first_line.ends_with('\n') {
+        first_line.pop();
+
+        if first_line.ends_with('\r') {
+            first_line.pop();
+        }
+    }
 
     if let Ok(parser) = v3::open(&first_line) {
-        Ok(parser.parse(lines))
+        Ok(parser.parse(reader.lines()))
     } else if let Ok(parser) = v2::open(&first_line) {
-        Ok(parser.parse(lines))
+        Ok(parser.parse(reader.lines()))
     } else {
-        let json = std::iter::once(Ok(first_line))
-            .chain(lines)
-            .collect::<io::Result<String>>()?;
+        let trimmed = first_line.trim_start();
+
+        if !trimmed.is_empty() && !trimmed.starts_with('{') {
+            return Err(anyhow!("not a v1, v2, v3 asciicast file"));
+        }
+
+        let remaining_limit = MAX_V1_SIZE.saturating_sub(bytes_read);
+        let mut json = first_line;
+        json.push('\n');
+
+        let rest_bytes = reader
+            .take((remaining_limit as u64) + 1)
+            .read_to_string(&mut json)?;
+
+        if rest_bytes > remaining_limit {
+            return Err(anyhow!("not a v1, v2, v3 asciicast file"));
+        }
 
         v1::load(json).map_err(|_| anyhow!("not a v1, v2, v3 asciicast file"))
     }
@@ -628,5 +662,135 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>()
+    }
+
+    use std::io::{self, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    struct BoundedPatternReader {
+        pattern: Vec<u8>,
+        offset: usize,
+        remaining: usize,
+        max_allowed_reads: usize,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for BoundedPatternReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 || buf.is_empty() {
+                return Ok(0);
+            }
+            let to_copy = buf.len().min(self.remaining);
+            for slot in &mut buf[..to_copy] {
+                *slot = self.pattern[self.offset];
+                self.offset = (self.offset + 1) % self.pattern.len();
+            }
+            self.remaining -= to_copy;
+            let total = self.bytes_read.fetch_add(to_copy, Ordering::SeqCst) + to_copy;
+            assert!(
+                total <= self.max_allowed_reads,
+                "unbounded read detected: read {total} bytes (limit {})",
+                self.max_allowed_reads
+            );
+            Ok(to_copy)
+        }
+    }
+
+    #[test]
+    fn open_rejects_huge_malformed_multiline_stream_in_bounded_memory() {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        // Simulate a 1 GiB stream of newline-delimited non-v2/v3 JSON lines
+        let reader = BoundedPatternReader {
+            pattern: b"{\"not_asciicast\": true, \"padding\": \"0123456789abcdef\"}\n".to_vec(),
+            offset: 0,
+            remaining: 1024 * 1024 * 1024, // 1 GiB logical stream
+            max_allowed_reads: 34 * 1024 * 1024, // Must stop near 32 MiB cap
+            bytes_read: Arc::clone(&bytes_read),
+        };
+
+        let result = super::open(BufReader::new(reader));
+        assert!(result.is_err());
+        assert!(bytes_read.load(Ordering::SeqCst) <= 34 * 1024 * 1024);
+    }
+
+    #[test]
+    fn open_rejects_huge_newlineless_stream_in_bounded_memory() {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        // Simulate a 1 GiB stream with no newlines at all
+        let reader = BoundedPatternReader {
+            pattern: vec![b'X'; 4096],
+            offset: 0,
+            remaining: 1024 * 1024 * 1024, // 1 GiB logical stream
+            max_allowed_reads: 34 * 1024 * 1024,
+            bytes_read: Arc::clone(&bytes_read),
+        };
+
+        let result = super::open(BufReader::new(reader));
+        assert!(result.is_err());
+        assert!(bytes_read.load(Ordering::SeqCst) <= 34 * 1024 * 1024);
+    }
+
+    #[test]
+    fn open_rejects_non_json_first_line_immediately() {
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let reader = BoundedPatternReader {
+            pattern: b"plain text line that is not json\n".to_vec(),
+            offset: 0,
+            remaining: 1024 * 1024 * 1024,
+            max_allowed_reads: 64 * 1024, // Should only read a single buffer
+            bytes_read: Arc::clone(&bytes_read),
+        };
+
+        let err = super::open(BufReader::new(reader))
+            .err()
+            .expect("should fail immediately on non-JSON line");
+        assert_eq!(err.to_string(), "not a v1, v2, v3 asciicast file");
+        assert!(bytes_read.load(Ordering::SeqCst) <= 64 * 1024);
+    }
+
+    #[test]
+    fn open_from_path_rejects_malformed_file_over_cap() {
+        let mut temp = NamedTempFile::new().unwrap();
+        let chunk = vec![b'{'; 64 * 1024];
+        temp.write_all(b"{\"version\": 1, \"width\": 80, \"height\": 24, \"stdout\": [\n")
+            .unwrap();
+        for _ in 0..(33 * 16) {
+            temp.write_all(&chunk).unwrap();
+            temp.write_all(b"\n").unwrap();
+        }
+        temp.flush().unwrap();
+
+        let result = super::open_from_path(temp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_allows_v3_stream_exceeding_32_mib_without_truncation() {
+        let header = b"{\"version\":3,\"term\":{\"cols\":80,\"rows\":24}}\n";
+        let mut event_line = b"[0.001,\"o\",\"".to_vec();
+        event_line.extend(std::iter::repeat_n(b'a', 4096));
+        event_line.extend_from_slice(b"\"]\n");
+
+        let total_events = 9000; // ~36 MiB > 32 MiB
+        let body_len = event_line.len() * total_events;
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+
+        let header_reader = io::Cursor::new(header.to_vec());
+        let events_reader = BoundedPatternReader {
+            pattern: event_line,
+            offset: 0,
+            remaining: body_len,
+            max_allowed_reads: body_len + 1024,
+            bytes_read: Arc::clone(&bytes_read),
+        };
+
+        let cast = super::open(BufReader::new(header_reader.chain(events_reader))).unwrap();
+        assert_eq!(cast.version, 3);
+
+        let count = cast.events.map(|e| e.unwrap()).count();
+        assert_eq!(count, total_events);
+        assert_eq!(bytes_read.load(Ordering::SeqCst), body_len);
     }
 }
