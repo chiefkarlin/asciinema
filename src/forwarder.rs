@@ -154,7 +154,9 @@ fn build_request(url: &url::Url) -> anyhow::Result<ClientRequestBuilder> {
         .with_sub_protocol("v1.alis")
         .with_header("user-agent", api::build_user_agent());
 
-    if url.host_str().is_some_and(|h| h.ends_with(".run.app")) {
+    if let Some((hdr_name, hdr_val)) = api::get_transport_auth_header() {
+        builder = builder.with_header(hdr_name, hdr_val);
+    } else if url.host_str().is_some_and(|h| h.ends_with(".run.app")) {
         if let Some(token) = get_cloud_run_id_token() {
             builder = builder.with_header("x-serverless-authorization", format!("Bearer {token}"));
         }

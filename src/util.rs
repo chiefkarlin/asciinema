@@ -19,12 +19,44 @@ pub fn get_local_path(filename: &str) -> anyhow::Result<Box<dyn AsRef<Path>>> {
 }
 
 fn download_asciicast(url: &str) -> anyhow::Result<NamedTempFile> {
-    use reqwest::blocking::Client;
+    use reqwest::blocking::{Client, Response};
+    use reqwest::redirect::Policy;
 
-    let client = Client::builder().timeout(None).build()?;
+    let client = Client::builder()
+        .timeout(None)
+        .redirect(Policy::none())
+        .build()?;
     let parsed_url = Url::parse(url)?;
-    let mut response = client.get(parsed_url.clone()).send()?;
-    response.error_for_status_ref()?;
+
+    let fetch_following_redirects = |start_url: Url| -> anyhow::Result<Response> {
+        let mut current = start_url;
+        for _ in 0..10 {
+            let mut req = client.get(current.clone());
+            let is_gcs = current
+                .host_str()
+                .is_some_and(|h| h.eq_ignore_ascii_case("storage.googleapis.com"));
+            if !is_gcs {
+                if let Some((hdr_name, hdr_val)) = crate::api::get_transport_auth_header() {
+                    req = req.header(hdr_name, hdr_val);
+                }
+            }
+            let resp = req.send()?;
+            if resp.status().is_redirection() {
+                if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
+                    let loc_str = loc.to_str()?;
+                    current = current
+                        .join(loc_str)
+                        .or_else(|_| Url::parse(loc_str))?;
+                    continue;
+                }
+            }
+            resp.error_for_status_ref()?;
+            return Ok(resp);
+        }
+        bail!("too many redirects while downloading {url}")
+    };
+
+    let mut response = fetch_following_redirects(parsed_url.clone())?;
     let mut file = NamedTempFile::new()?;
 
     let content_type = response
@@ -42,8 +74,7 @@ fn download_asciicast(url: &str) -> anyhow::Result<NamedTempFile> {
             let cast_url = base_url
                 .join(&href)
                 .or_else(|_| parsed_url.join(&href))?;
-            let mut response = client.get(cast_url).send()?;
-            response.error_for_status_ref()?;
+            let mut response = fetch_following_redirects(cast_url)?;
             io::copy(&mut response, &mut file)?;
 
             Ok(file)
